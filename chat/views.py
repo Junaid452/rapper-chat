@@ -452,6 +452,9 @@ def stream_reply(request, conversation_id):
         # the error paths below.
         status_active = False
         prompt_eval_sent = False
+        # Whether the reader cut the reply short. Only used to label the turn for
+        # Langfuse: a half-written answer is not the model's work to be judged on.
+        stopped = False
 
         # Started before the agent and read while it streams, so the critique of
         # the question is written *alongside* the answer rather than in front of
@@ -534,6 +537,7 @@ def stream_reply(request, conversation_id):
                     if frame:
                         yield frame
                     if Conversation.objects.filter(pk=conversation.pk, stop_requested=True).exists():
+                        stopped = True
                         break
 
             # Stopped mid-search, or the run ended having only ever called tools:
@@ -563,7 +567,8 @@ def stream_reply(request, conversation_id):
             # than allowed to propagate, so the span would otherwise close as a
             # success and this turn would not show up when filtering for errors.
             turn_span.update(output={'error': str(e)}, level='ERROR',
-                             status_message=str(e))
+                             status_message=str(e),
+                             metadata={'turn_outcome': 'error'})
             yield sse_frame('status', '')
             # The question was still worth critiquing even though answering it
             # failed, and the slot for it is already on the page.
@@ -594,7 +599,22 @@ def stream_reply(request, conversation_id):
         # The reply as the trace's output. Set here rather than at the end of the
         # generator so a turn the reader stopped early still records what was
         # actually produced.
-        turn_span.update(output=full)
+        #
+        # turn_outcome says whether this turn is a fair thing to grade. The
+        # LLM-as-a-judge evaluator in Langfuse filters on it, because the three
+        # other endings all put something in `output` that is not an answer: an
+        # error object, a half-written reply the reader cancelled, or nothing at
+        # all. Judged unfiltered they would read as the model answering badly,
+        # and the score would track how often people hit stop rather than how
+        # good the answers are. 'stopped' wins over an empty string -- a stop
+        # that landed before the first token is still a stop, not a failure to
+        # speak.
+        turn_span.update(
+            output=full,
+            metadata={'turn_outcome': (
+                'stopped' if stopped else 'answered' if full.strip() else 'empty'
+            )},
+        )
         Message.objects.create(conversation=conversation, role='assistant', content=full, content_html=full_html)
         conversation.stop_requested = False
         conversation.save(update_fields=['stop_requested', 'updated_at'])
